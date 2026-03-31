@@ -8,3 +8,6 @@ typing-extensions==4.15.0
 datasets
 tiktoken
 sentencepiece
+
+# FlashAttention 3 must be installed separately; see README.md
+zstandard
