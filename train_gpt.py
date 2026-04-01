@@ -41,7 +41,11 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 256)) # changed for h-net
+    hnet_dim = int(os.environ.get("HNET_DIM", 64))
+    boundary_penalty_weight = float(os.environ.get("BOUNDARY_PENALTY_WEIGHT", 0.1))
+    space_curriculum_steps = int(os.environ.get("SPACE_CURRICULUM_STEPS", 2000))
+    target_boundary_rate = float(os.environ.get("TARGET_BOUNDARY_RATE", 0.2))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -439,9 +443,11 @@ def load_data_shard(file: Path) -> Tensor:
     expected_size = header_bytes + num_tokens * token_bytes
     if file.stat().st_size != expected_size:
         raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
-    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
-    if tokens_np.size != num_tokens:
+    # Read raw uint16 tokens, then reinterpret as individual bytes for byte-level H-net
+    tokens_u16 = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
+    if tokens_u16.size != num_tokens:
         raise ValueError(f"Short read for {file}")
+    tokens_np = tokens_u16.view(np.uint8)  # 2 bytes per uint16, gives 2*num_tokens bytes
     return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
 class TokenStream:
     def __init__(self, pattern: str):
@@ -702,6 +708,38 @@ class Block(nn.Module):
             x_out = x_in + gate * (x_out - x_in)
         return x_out, raw_v
 
+# added for hnet
+class StraightThroughBoundary(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, boundary_probs, threshold=0.5):
+        hard_boundaries = (boundary_probs >= threshold).float()
+        ctx.save_for_backward(boundary_probs)
+        return hard_boundaries
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None
+
+class HNetScout(nn.Module):
+    def __init__(self, byte_vocab_size=256, embed_dim=512, hnet_dim=64):
+        super().__init__()
+        self.byte_embed = nn.Embedding(byte_vocab_size, embed_dim)
+        # 1D Convs to scout local neighborhoods
+        self.scout_conv1 = nn.Conv1d(embed_dim, hnet_dim, kernel_size=3, padding=1)
+        self.scout_conv2 = nn.Conv1d(hnet_dim, 1, kernel_size=3, padding=1)
+
+    def forward(self, bytes_input):
+        x = self.byte_embed(bytes_input)
+        x_conv = x.transpose(1, 2)
+
+        hidden = F.relu(self.scout_conv1(x_conv))
+        logits = self.scout_conv2(hidden)
+
+        boundary_probs = torch.sigmoid(logits.transpose(1, 2))
+        hard_boundaries = StraightThroughBoundary.apply(boundary_probs)
+
+        return x, hard_boundaries, boundary_probs
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -738,7 +776,7 @@ class GPT(nn.Module):
         self.value_residual = value_residual
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.hnet = HNetScout(byte_vocab_size=vocab_size, embed_dim=model_dim, hnet_dim=64) # changed for hnet
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -802,7 +840,7 @@ class GPT(nn.Module):
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
-            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+            nn.init.normal_(self.hnet.byte_embed.weight, mean=0.0, std=self.tied_embed_init_std) # changed for hnet
         n = self.num_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
         # Init banks: orthogonal, with proj layers scaled down and out/down zero-init
@@ -832,10 +870,21 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor,
+                boundary_penalty_weight: float = 0.1,
+                space_curriculum_alpha: float = 0.0,
+                target_boundary_rate: float = 0.2) -> Tensor:
         n = self.num_layers
-        x = self.tok_emb(input_ids)
+
+        # 1. H-Net generates embeddings and boundaries
+        x, hard_boundaries, soft_probs = self.hnet(input_ids)
+
         x = F.rms_norm(x, (x.size(-1),))
+
+        # 2. Gate the input. Non-boundaries become zeros.
+        # The SmearGate immediately following this will smear the last valid boundary forward!
+        x = x * hard_boundaries
+
         x = self.smear(x)
         x0 = x
         v0 = None
@@ -863,7 +912,7 @@ class GPT(nn.Module):
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x_flat, self.tok_emb.weight)
+            logits_proj = F.linear(x_flat, self.hnet.byte_embed.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -886,12 +935,31 @@ class GPT(nn.Module):
                 mtp_loss_count += 1
             if mtp_loss_count > 0:
                 main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
+        # Boundary regularization: penalize deviation from target boundary rate
+        if self.training and boundary_penalty_weight > 0:
+            boundary_rate = soft_probs.mean()
+            boundary_penalty = (boundary_rate - target_boundary_rate).pow(2)
+            main_loss = main_loss + boundary_penalty_weight * boundary_penalty
+        # Space curriculum: force boundaries at space characters (byte 32) early in training
+        if self.training and space_curriculum_alpha > 0:
+            space_targets = (input_ids == 32).float().unsqueeze(-1)  # (batch, seq, 1)
+            space_loss = F.binary_cross_entropy(soft_probs, space_targets, reduction="mean")
+            main_loss = main_loss + space_curriculum_alpha * space_loss
         return main_loss
+
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         n = self.num_layers
-        x = self.tok_emb(input_ids)
+
+        # 1. H-Net generates embeddings and boundaries
+        x, hard_boundaries, soft_probs = self.hnet(input_ids)
+
         x = F.rms_norm(x, (x.size(-1),))
+
+        # 2. Gate the input. Non-boundaries become zeros.
+        # The SmearGate immediately following this will smear the last valid boundary forward!
+        x = x * hard_boundaries
+
         x = self.smear(x)
         x0 = x
         v0 = None
@@ -917,7 +985,7 @@ class GPT(nn.Module):
                 v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, self.hnet.byte_embed.weight)
         else:
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
@@ -1545,6 +1613,9 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
+    # Keep H-net conv layers in float32 for training stability
+    base_model.hnet.scout_conv1.float()
+    base_model.hnet.scout_conv2.float()
     restore_low_dim_params_to_fp32(base_model)
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
@@ -1570,7 +1641,10 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+    tok_params = [{"params": [base_model.hnet.byte_embed.weight], "lr": token_lr, "base_lr": token_lr}]
+    # H-net conv params: train with scalar_lr via Adam
+    hnet_conv_params = list(base_model.hnet.scout_conv1.parameters()) + list(base_model.hnet.scout_conv2.parameters())
+    scalar_params.extend(hnet_conv_params)
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
@@ -1663,7 +1737,10 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y,
+                                        boundary_penalty_weight=args.boundary_penalty_weight,
+                                        space_curriculum_alpha=1.0,
+                                        target_boundary_rate=args.target_boundary_rate)
                 (warmup_loss * grad_scale).backward()
             # All-reduce all grads for warmup (simple, not optimized)
             if distributed:
@@ -1725,11 +1802,19 @@ def main() -> None:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
+        # Space curriculum: linearly decay from 1.0 to 0.0 over space_curriculum_steps
+        if args.space_curriculum_steps > 0:
+            space_alpha = max(1.0 - step / args.space_curriculum_steps, 0.0)
+        else:
+            space_alpha = 0.0
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y,
+                             boundary_penalty_weight=args.boundary_penalty_weight,
+                             space_curriculum_alpha=space_alpha,
+                             target_boundary_rate=args.target_boundary_rate)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1779,8 +1864,14 @@ def main() -> None:
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
         if should_log_train:
+            # Log boundary stats from the H-net for monitoring convergence
+            with torch.no_grad():
+                _, hb, sp = base_model.hnet(x[:1])  # quick probe on last batch
+                brate = hb.mean().item()
+                sp_mean = sp.mean().item()
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"boundary_rate:{brate:.3f} boundary_prob:{sp_mean:.3f} space_alpha:{space_alpha:.3f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
