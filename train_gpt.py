@@ -731,12 +731,12 @@ class HNetScout(nn.Module):
         x_conv = x.transpose(1, 2)
 
         hidden = F.relu(self.scout_conv1(x_conv))
-        logits = self.scout_conv2(hidden)
+        boundary_logits = self.scout_conv2(hidden).transpose(1, 2)  # (batch, seq, 1)
 
-        boundary_probs = torch.sigmoid(logits.transpose(1, 2))
+        boundary_probs = torch.sigmoid(boundary_logits)
         hard_boundaries = StraightThroughBoundary.apply(boundary_probs)
 
-        return x, hard_boundaries, boundary_probs
+        return x, hard_boundaries, boundary_probs, boundary_logits
 
 class GPT(nn.Module):
     def __init__(
@@ -875,7 +875,7 @@ class GPT(nn.Module):
         n = self.num_layers
 
         # 1. H-Net generates embeddings and boundaries
-        x, hard_boundaries, soft_probs = self.hnet(input_ids)
+        x, hard_boundaries, soft_probs, boundary_logits = self.hnet(input_ids)
 
         x = F.rms_norm(x, (x.size(-1),))
 
@@ -939,9 +939,12 @@ class GPT(nn.Module):
             boundary_penalty = (boundary_rate - target_boundary_rate).pow(2)
             main_loss = main_loss + boundary_penalty_weight * boundary_penalty
         # Space curriculum: force boundaries at space characters (byte 32) early in training
+        # Uses bce_with_logits (autocast-safe) on raw logits instead of bce on probs
         if self.training and space_curriculum_alpha > 0:
             space_targets = (input_ids == 32).float().unsqueeze(-1)  # (batch, seq, 1)
-            space_loss = F.binary_cross_entropy(soft_probs, space_targets, reduction="mean")
+            space_loss = F.binary_cross_entropy_with_logits(
+                boundary_logits.float(), space_targets, reduction="mean"
+            )
             main_loss = main_loss + space_curriculum_alpha * space_loss
         return main_loss
 
@@ -950,12 +953,11 @@ class GPT(nn.Module):
         n = self.num_layers
 
         # 1. H-Net generates embeddings and boundaries
-        x, hard_boundaries, soft_probs = self.hnet(input_ids)
+        x, hard_boundaries, _, _ = self.hnet(input_ids)
 
         x = F.rms_norm(x, (x.size(-1),))
 
         # 2. Gate the input. Non-boundaries become zeros.
-        # The SmearGate immediately following this will smear the last valid boundary forward!
         x = x * hard_boundaries
 
         x = self.smear(x)
@@ -1864,7 +1866,7 @@ def main() -> None:
         if should_log_train:
             # Log boundary stats from the H-net for monitoring convergence
             with torch.no_grad():
-                _, hb, sp = base_model.hnet(x[:1])  # quick probe on last batch
+                _, hb, sp, _ = base_model.hnet(x[:1])  # quick probe on last batch
                 brate = hb.mean().item()
                 sp_mean = sp.mean().item()
             log0(
