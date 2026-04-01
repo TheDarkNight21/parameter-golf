@@ -443,12 +443,10 @@ def load_data_shard(file: Path) -> Tensor:
     expected_size = header_bytes + num_tokens * token_bytes
     if file.stat().st_size != expected_size:
         raise ValueError(f"Shard size mismatch for {file}: expected {expected_size} bytes")
-    # Read raw uint16 tokens, then reinterpret as individual bytes for byte-level H-net
-    tokens_u16 = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
-    if tokens_u16.size != num_tokens:
+    tokens_np = np.fromfile(file, dtype="<u2", count=num_tokens, offset=header_bytes)
+    if tokens_np.size != num_tokens:
         raise ValueError(f"Short read for {file}")
-    tokens_np = tokens_u16.view(np.uint8)  # 2 bytes per uint16, gives 2*num_tokens bytes
-    return torch.from_numpy(tokens_np.astype(np.uint16, copy=False))
+    return torch.from_numpy(tokens_np.astype(np.int64, copy=False))
 class TokenStream:
     def __init__(self, pattern: str):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
