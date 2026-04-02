@@ -1777,8 +1777,10 @@ def main() -> None:
     swa_count = 0
     from collections import deque
     lawa_queue: deque[dict[str, Tensor]] = deque(maxlen=args.lawa_k)
-    ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+    ema_state: dict[str, Tensor] | None = None
+    ema_started = False
     ema_decay = 0.997
+    ema_start_step = args.space_curriculum_steps  # start EMA after curriculum phase
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1865,10 +1867,16 @@ def main() -> None:
         # Phase 3: Wait for RS, local NS5, all-gather (banks processed last)
         optimizer_muon.step()
         zero_grad_all()
-        # EMA update
-        with torch.no_grad():
-            for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+        # EMA update — delayed start until after curriculum phase
+        if step >= ema_start_step:
+            if not ema_started:
+                ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+                ema_started = True
+                log0(f"ema:start step:{step + 1} (after curriculum)")
+            else:
+                with torch.no_grad():
+                    for name, t in base_model.state_dict().items():
+                        ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
@@ -1925,11 +1933,13 @@ def main() -> None:
             avg_state[name] /= len(lawa_queue)
             avg_state[name] = avg_state[name].to(dtype=current_state[name].dtype)
         base_model.load_state_dict(avg_state, strict=True)
-    else:
-        log0("ema:applying EMA weights")
+    elif ema_state is not None:
+        log0(f"ema:applying EMA weights (started at step {ema_start_step})")
         current_state = base_model.state_dict()
         avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
+    else:
+        log0("ema:skipped (never started), using raw final weights")
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
     diag_val_loss = eval_val(
