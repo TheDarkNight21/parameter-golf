@@ -305,7 +305,11 @@ def eval_val(
             x = local[:-1].reshape(-1, seq_len)
             y = local[1:].reshape(-1, seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
+                _zero = torch.tensor(0.0, device=device)
+                batch_loss = model(x, y,
+                                   boundary_penalty_weight=0.0,
+                                   space_curriculum_alpha=_zero,
+                                   target_boundary_rate=0.0).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -870,8 +874,9 @@ class GPT(nn.Module):
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def forward(self, input_ids: Tensor, target_ids: Tensor,
                 boundary_penalty_weight: float = 0.1,
-                space_curriculum_alpha: float = 0.0,
-                target_boundary_rate: float = 0.2) -> Tensor:
+                space_curriculum_alpha: Tensor | None = None,
+                target_boundary_rate: float = 0.2,
+                _training: bool = True) -> Tensor:
         n = self.num_layers
 
         # 1. H-Net generates embeddings and boundaries
@@ -933,19 +938,16 @@ class GPT(nn.Module):
                 mtp_loss_count += 1
             if mtp_loss_count > 0:
                 main_loss = main_loss + self.mtp_loss_weight * (mtp_loss_sum / mtp_loss_count)
-        # Boundary regularization: penalize deviation from target boundary rate
-        if self.training and boundary_penalty_weight > 0:
-            boundary_rate = soft_probs.mean()
-            boundary_penalty = (boundary_rate - target_boundary_rate).pow(2)
-            main_loss = main_loss + boundary_penalty_weight * boundary_penalty
-        # Space curriculum: force boundaries at space characters (byte 32) early in training
-        # Uses bce_with_logits (autocast-safe) on raw logits instead of bce on probs
-        if self.training and space_curriculum_alpha > 0:
-            space_targets = (input_ids == 32).float().unsqueeze(-1)  # (batch, seq, 1)
-            space_loss = F.binary_cross_entropy_with_logits(
-                boundary_logits.float(), space_targets, reduction="mean"
-            )
-            main_loss = main_loss + space_curriculum_alpha * space_loss
+        # Boundary regularization + space curriculum (always computed, gated by weights)
+        # No Python-level branching — keeps torch.compile happy with a single graph
+        boundary_rate = soft_probs.mean()
+        boundary_penalty = (boundary_rate - target_boundary_rate).pow(2)
+        main_loss = main_loss + boundary_penalty_weight * boundary_penalty
+        space_targets = (input_ids == 32).float().unsqueeze(-1)  # (batch, seq, 1)
+        space_loss = F.binary_cross_entropy_with_logits(
+            boundary_logits.float(), space_targets, reduction="mean"
+        )
+        main_loss = main_loss + space_curriculum_alpha * space_loss
         return main_loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
@@ -1739,7 +1741,7 @@ def main() -> None:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y,
                                         boundary_penalty_weight=args.boundary_penalty_weight,
-                                        space_curriculum_alpha=1.0,
+                                        space_curriculum_alpha=torch.tensor(1.0, device=device),
                                         target_boundary_rate=args.target_boundary_rate)
                 (warmup_loss * grad_scale).backward()
             # All-reduce all grads for warmup (simple, not optimized)
@@ -1803,17 +1805,19 @@ def main() -> None:
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         zero_grad_all()
         # Space curriculum: linearly decay from 1.0 to 0.0 over space_curriculum_steps
+        # Always pass a tensor (never None/float) to avoid torch.compile recompilation
         if args.space_curriculum_steps > 0:
-            space_alpha = max(1.0 - step / args.space_curriculum_steps, 0.0)
+            space_alpha_val = max(1.0 - step / args.space_curriculum_steps, 0.0)
         else:
-            space_alpha = 0.0
+            space_alpha_val = 0.0
+        space_alpha_tensor = torch.tensor(space_alpha_val, device=device)
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y,
                              boundary_penalty_weight=args.boundary_penalty_weight,
-                             space_curriculum_alpha=space_alpha,
+                             space_curriculum_alpha=space_alpha_tensor,
                              target_boundary_rate=args.target_boundary_rate)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
@@ -1872,7 +1876,7 @@ def main() -> None:
                 sp_mean = sp.mean().item()
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"boundary_rate:{brate:.3f} boundary_prob:{sp_mean:.3f} space_alpha:{space_alpha:.3f} "
+                f"boundary_rate:{brate:.3f} boundary_prob:{sp_mean:.3f} space_alpha:{space_alpha_val:.3f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
