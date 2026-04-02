@@ -46,6 +46,8 @@ class Hyperparameters:
     boundary_penalty_weight = float(os.environ.get("BOUNDARY_PENALTY_WEIGHT", 0.1))
     space_curriculum_steps = int(os.environ.get("SPACE_CURRICULUM_STEPS", 2000))
     target_boundary_rate = float(os.environ.get("TARGET_BOUNDARY_RATE", 0.2))
+    gumbel_temp_start = float(os.environ.get("GUMBEL_TEMP_START", 1.0))
+    gumbel_temp_end = float(os.environ.get("GUMBEL_TEMP_END", 0.01))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -309,7 +311,8 @@ def eval_val(
                 batch_loss = model(x, y,
                                    boundary_penalty_weight=0.0,
                                    space_curriculum_alpha=_zero,
-                                   target_boundary_rate=0.0).detach()
+                                   target_boundary_rate=0.0,
+                                   gumbel_temperature=_zero).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -711,17 +714,6 @@ class Block(nn.Module):
         return x_out, raw_v
 
 # added for hnet
-class StraightThroughBoundary(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, boundary_probs, threshold=0.5):
-        hard_boundaries = (boundary_probs >= threshold).float()
-        ctx.save_for_backward(boundary_probs)
-        return hard_boundaries
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None
-
 class HNetScout(nn.Module):
     def __init__(self, byte_vocab_size=256, embed_dim=512, hnet_dim=64):
         super().__init__()
@@ -730,15 +722,23 @@ class HNetScout(nn.Module):
         self.scout_conv1 = nn.Conv1d(embed_dim, hnet_dim, kernel_size=3, padding=1)
         self.scout_conv2 = nn.Conv1d(hnet_dim, 1, kernel_size=3, padding=1)
 
-    def forward(self, bytes_input):
+    def forward(self, bytes_input, temperature, boundary_k):
         x = self.byte_embed(bytes_input)
         x_conv = x.transpose(1, 2)
 
         hidden = F.relu(self.scout_conv1(x_conv))
         boundary_logits = self.scout_conv2(hidden).transpose(1, 2)  # (batch, seq, 1)
-
         boundary_probs = torch.sigmoid(boundary_logits)
-        hard_boundaries = StraightThroughBoundary.apply(boundary_probs)
+
+        # Gumbel-Top-k: add noise scaled by temperature, select top-k
+        logits_2d = boundary_logits.squeeze(-1)  # (batch, seq)
+        gumbel_noise = -torch.log(-torch.log(
+            torch.rand_like(logits_2d).clamp(1e-6, 1 - 1e-6)
+        ))
+        perturbed = logits_2d + temperature * gumbel_noise
+        _, topk_idx = torch.topk(perturbed, k=boundary_k, dim=1)
+        hard_boundaries = torch.zeros_like(logits_2d).scatter_(1, topk_idx, 1.0)
+        hard_boundaries = hard_boundaries.unsqueeze(-1)  # (batch, seq, 1)
 
         return x, hard_boundaries, boundary_probs, boundary_logits
 
@@ -767,8 +767,11 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        target_boundary_rate: float = 0.2,
+        train_seq_len: int = 2048,
     ):
         super().__init__()
+        self.boundary_k = int(target_boundary_rate * train_seq_len)
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -876,11 +879,14 @@ class GPT(nn.Module):
                 boundary_penalty_weight: float = 0.1,
                 space_curriculum_alpha: Tensor | None = None,
                 target_boundary_rate: float = 0.2,
+                gumbel_temperature: Tensor | None = None,
                 _training: bool = True) -> Tensor:
         n = self.num_layers
 
-        # 1. H-Net generates embeddings and boundaries
-        x, hard_boundaries, soft_probs, boundary_logits = self.hnet(input_ids)
+        # 1. H-Net generates embeddings and boundaries via Gumbel-Top-k
+        x, hard_boundaries, soft_probs, boundary_logits = self.hnet(
+            input_ids, temperature=gumbel_temperature, boundary_k=self.boundary_k
+        )
 
         x = F.rms_norm(x, (x.size(-1),))
 
@@ -941,7 +947,7 @@ class GPT(nn.Module):
         # Boundary regularization + space curriculum (always computed, gated by weights)
         # No Python-level branching — keeps torch.compile happy with a single graph
         boundary_rate = soft_probs.mean()
-        boundary_penalty = (boundary_rate - target_boundary_rate).pow(2)
+        boundary_penalty = (boundary_rate - target_boundary_rate).abs()
         main_loss = main_loss + boundary_penalty_weight * boundary_penalty
         space_targets = (input_ids == 32).float().unsqueeze(-1)  # (batch, seq, 1)
         space_loss = F.binary_cross_entropy_with_logits(
@@ -954,8 +960,12 @@ class GPT(nn.Module):
         """Return logits (bsz, seq_len, vocab) without computing loss."""
         n = self.num_layers
 
-        # 1. H-Net generates embeddings and boundaries
-        x, hard_boundaries, _, _ = self.hnet(input_ids)
+        # 1. H-Net generates embeddings and boundaries (deterministic: temp=0)
+        x, hard_boundaries, _, _ = self.hnet(
+            input_ids,
+            temperature=torch.zeros((), device=input_ids.device),
+            boundary_k=self.boundary_k,
+        )
 
         x = F.rms_norm(x, (x.size(-1),))
 
@@ -1606,6 +1616,8 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        target_boundary_rate=args.target_boundary_rate,
+        train_seq_len=args.train_seq_len,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1742,7 +1754,8 @@ def main() -> None:
                     warmup_loss = model(x, y,
                                         boundary_penalty_weight=args.boundary_penalty_weight,
                                         space_curriculum_alpha=torch.tensor(1.0, device=device),
-                                        target_boundary_rate=args.target_boundary_rate)
+                                        target_boundary_rate=args.target_boundary_rate,
+                                        gumbel_temperature=torch.tensor(1.0, device=device))
                 (warmup_loss * grad_scale).backward()
             # All-reduce all grads for warmup (simple, not optimized)
             if distributed:
@@ -1811,6 +1824,10 @@ def main() -> None:
         else:
             space_alpha_val = 0.0
         space_alpha_tensor = torch.tensor(space_alpha_val, device=device)
+        # Gumbel temperature: linear anneal from start to end over full training
+        gumbel_frac = min(step / args.iterations, 1.0) if args.iterations > 0 else 1.0
+        gumbel_temp_val = args.gumbel_temp_start + gumbel_frac * (args.gumbel_temp_end - args.gumbel_temp_start)
+        gumbel_temp_tensor = torch.tensor(gumbel_temp_val, device=device)
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
@@ -1818,7 +1835,8 @@ def main() -> None:
                 loss = model(x, y,
                              boundary_penalty_weight=args.boundary_penalty_weight,
                              space_curriculum_alpha=space_alpha_tensor,
-                             target_boundary_rate=args.target_boundary_rate)
+                             target_boundary_rate=args.target_boundary_rate,
+                             gumbel_temperature=gumbel_temp_tensor)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1871,12 +1889,16 @@ def main() -> None:
             # Log boundary stats from the H-net for monitoring convergence
             with torch.no_grad():
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    _, hb, sp, _ = base_model.hnet(x[:1])  # quick probe on last batch
+                    _, hb, sp, _ = base_model.hnet(
+                        x[:1],
+                        temperature=torch.zeros((), device=device),
+                        boundary_k=base_model.boundary_k,
+                    )
                 brate = hb.mean().item()
                 sp_mean = sp.mean().item()
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
-                f"boundary_rate:{brate:.3f} boundary_prob:{sp_mean:.3f} space_alpha:{space_alpha_val:.3f} "
+                f"boundary_rate:{brate:.3f} boundary_prob:{sp_mean:.3f} space_alpha:{space_alpha_val:.3f} gumbel_temp:{gumbel_temp_val:.3f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -2046,6 +2068,7 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        target_boundary_rate=args.target_boundary_rate, train_seq_len=args.train_seq_len,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
