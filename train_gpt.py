@@ -736,7 +736,8 @@ class HNetScout(nn.Module):
             torch.rand_like(logits_2d).clamp(1e-6, 1 - 1e-6)
         ))
         perturbed = logits_2d + temperature * gumbel_noise
-        _, topk_idx = torch.topk(perturbed, k=boundary_k, dim=1)
+        actual_k = min(boundary_k, perturbed.shape[1])
+        _, topk_idx = torch.topk(perturbed, k=actual_k, dim=1)
         hard_boundaries = torch.zeros_like(logits_2d).scatter_(1, topk_idx, 1.0)
         hard_boundaries = hard_boundaries.unsqueeze(-1)  # (batch, seq, 1)
 
