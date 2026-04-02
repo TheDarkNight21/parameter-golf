@@ -1866,7 +1866,8 @@ def main() -> None:
         if should_log_train:
             # Log boundary stats from the H-net for monitoring convergence
             with torch.no_grad():
-                _, hb, sp, _ = base_model.hnet(x[:1])  # quick probe on last batch
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    _, hb, sp, _ = base_model.hnet(x[:1])  # quick probe on last batch
                 brate = hb.mean().item()
                 sp_mean = sp.mean().item()
             log0(
