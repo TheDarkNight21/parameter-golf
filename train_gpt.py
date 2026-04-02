@@ -1171,9 +1171,20 @@ def quantize_int6_gptq(weight, hessian=None, clip_range=31, block_size=128):
     W = t32[:, perm].clone()
     W[:, dead[perm]] = 0
     H = H[perm][:, perm]
-    Hinv = torch.linalg.cholesky(H)
-    Hinv = torch.cholesky_inverse(Hinv)
-    Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    # Cholesky with increasing dampening fallback for numerical stability
+    for extra_damp in [0.0, 0.01, 0.1, 1.0]:
+        try:
+            H_try = H.clone()
+            if extra_damp > 0:
+                H_try[torch.arange(cols), torch.arange(cols)] += extra_damp * torch.mean(torch.diag(H))
+            Hinv = torch.linalg.cholesky(H_try)
+            Hinv = torch.cholesky_inverse(Hinv)
+            Hinv = torch.linalg.cholesky(Hinv, upper=True)
+            break
+        except torch._C._LinAlgError:
+            if extra_damp >= 1.0:
+                raise
+            continue
     best_q = None; best_scale = None; best_err = float('inf')
     for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
         if pct < 1.0:
