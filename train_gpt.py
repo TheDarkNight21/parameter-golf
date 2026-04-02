@@ -1867,8 +1867,8 @@ def main() -> None:
         # Phase 3: Wait for RS, local NS5, all-gather (banks processed last)
         optimizer_muon.step()
         zero_grad_all()
-        # EMA update — delayed start until after curriculum phase
-        if step >= ema_start_step:
+        # EMA update — delayed start until after curriculum phase (gated by swa_enabled)
+        if args.swa_enabled and step >= ema_start_step:
             if not ema_started:
                 ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
                 ema_started = True
